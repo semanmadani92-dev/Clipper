@@ -321,33 +321,51 @@ def detect_faces(frame):
 
 def plan_framing(src, start, end, W, H):
     cap = cv2.VideoCapture(str(src))
-    found = []
+    frames = []
     for t in np.linspace(start + 0.5, end - 0.5, 24):
         cap.set(cv2.CAP_PROP_POS_MSEC, t * 1000)
         ok, frame = cap.read()
-        if not ok:
-            continue
-        faces = detect_faces(frame)
-        if faces:
-            found.append(max(faces, key=lambda f: f[2] * f[3]))  # largest face
+        if ok:
+            frames.append(detect_faces(frame))
     cap.release()
+    # Track the face seen in the most frames at the same spot (the streamer),
+    # not just the largest one: on-screen photos/videos add short-lived faces.
+    tol = 0.04 * W
+    best, best_n = None, 0
+    for cand in (f for fs in frames for f in fs):
+        ccx = cand[0] + cand[2] / 2
+        n_hit = sum(any(abs(f[0] + f[2] / 2 - ccx) < tol and 0.6 < f[2] / cand[2] < 1.6 for f in fs)
+                    for fs in frames)
+        if n_hit > best_n or (n_hit == best_n and best is not None and cand[2] > best[2]):
+            best, best_n = cand, n_hit
+    found = []
+    if best is not None:
+        bcx = best[0] + best[2] / 2
+        for fs in frames:
+            m = [f for f in fs if abs(f[0] + f[2] / 2 - bcx) < tol and 0.6 < f[2] / best[2] < 1.6]
+            if m:
+                found.append(min(m, key=lambda f: abs(f[0] + f[2] / 2 - bcx)))
     crop_w = int(H * 9 / 16) // 2 * 2
-    if len(found) < 4:
-        return {"mode": "crop", "x": (W - crop_w) // 2, "crop_w": crop_w, "faces": len(found)}
-    f = np.array(found)
-    cx, cy = np.median(f[:, 0] + f[:, 2] / 2), np.median(f[:, 1] + f[:, 3] / 2)
-    fw = np.median(f[:, 2])
-    spread = np.std(f[:, 0] + f[:, 2] / 2) / W
-    corner = (cx < W * 0.3 or cx > W * 0.7) and (cy < H * 0.35 or cy > H * 0.65)
-    if fw < W * 0.12 and spread < 0.02 and corner and len(found) >= 12:
+    if len(found) >= 12:
+        f = np.array(found)
+        cx, cy = np.median(f[:, 0] + f[:, 2] / 2), np.median(f[:, 1] + f[:, 3] / 2)
+        fw = np.median(f[:, 2])
+        spread = np.std(f[:, 0] + f[:, 2] / 2) / W
+    # A small face that barely moves is a webcam overlay, wherever it sits on screen.
+    if len(found) >= 12 and fw < W * 0.12 and spread < 0.03:
         # facecam overlay: box ~ 3.2x face width, 16:9, clamped to frame
         bw = int(min(W * 0.4, fw * 3.2)) // 2 * 2
         bh = int(bw * 9 / 16) // 2 * 2
         bx = int(np.clip(cx - bw / 2, 0, W - bw)) // 2 * 2
         by = int(np.clip(cy - bh / 2, 0, H - bh)) // 2 * 2
         return {"mode": "stack", "cam": (bw, bh, bx, by), "faces": len(found)}
+    # Full-frame camera: centre the crop on the largest face per frame (it moves around).
+    largest = [max(fs, key=lambda f: f[2] * f[3]) for fs in frames if fs]
+    if len(largest) < 4:
+        return {"mode": "crop", "x": (W - crop_w) // 2, "crop_w": crop_w, "faces": len(largest)}
+    cx = np.median([f[0] + f[2] / 2 for f in largest])
     x = int(np.clip(cx - crop_w / 2, 0, W - crop_w)) // 2 * 2
-    return {"mode": "crop", "x": x, "crop_w": crop_w, "faces": len(found)}
+    return {"mode": "crop", "x": x, "crop_w": crop_w, "faces": len(largest)}
 
 
 def video_filter(plan, W, H, ass):
@@ -441,7 +459,14 @@ def main():
         if vod:
             z = robust_z(twitch_chat_profile(vod, dur, work))
             rough = pick_peaks(z, args.n, min_gap=120, dur=dur, pre=pre, post=post)
-            peaks = sorted(twitch_refine_peak(vod, p) for p in rough)
+            refined = {}
+            for p in rough:
+                q = twitch_refine_peak(vod, p)
+                refined[q] = float(z[p])  # report the spike's sampled score
+            peaks = sorted(refined)
+            z = z.copy()
+            for q, zv in refined.items():
+                z[q] = zv
             mode = "twitch-chat"
         else:
             grid = np.zeros(int(dur) + 1)
