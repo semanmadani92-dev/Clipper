@@ -33,7 +33,7 @@ Captions: faster-whisper word timestamps -> ASS, 3-word pages, active word
 scaled up and coloured, cycling yellow/green/cyan/pink/orange per page
 (--captions yellow for a single colour), burned in with libass.
 """
-import argparse, json, os, re, subprocess, sys, time, urllib.request
+import argparse, calendar, json, os, re, subprocess, sys, time, urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -137,6 +137,70 @@ def gql_comments(vod, offset=None, cursor=None):
         msgs.append((float(n["contentOffsetSeconds"]), user, text))
     nxt = data["edges"][-1]["cursor"] if data["edges"] and data["pageInfo"]["hasNextPage"] else None
     return msgs, nxt
+
+
+def gql_query(query):
+    req = urllib.request.Request(GQL_URL, json.dumps({"query": query}).encode(), {
+        "Client-Id": GQL_CLIENT_ID, "Content-Type": "application/json"})
+    for attempt in range(4):
+        try:
+            r = json.load(urllib.request.urlopen(req, timeout=20))
+            if r.get("errors"):
+                raise RuntimeError(r["errors"][0].get("message"))
+            return r["data"]
+        except Exception:
+            if attempt == 3:
+                raise
+            time.sleep(1.5 * 2 ** attempt)
+
+
+def twitch_clip_moments(vod, dur, n, max_pages=10, max_len=75):
+    """Moments viewers clipped from this VOD, ranked by total clip views.
+
+    Clips of the same moment (overlapping VOD ranges) are merged; each window
+    is the viewers' own range plus a 2 s lead-in, trimmed around the most-viewed
+    clip when the merged range gets too long."""
+    meta = gql_query(f'query{{video(id:"{vod}"){{createdAt owner{{login}}}}}}')["video"]
+    login = meta["owner"]["login"]
+    age_days = (time.time() - calendar.timegm(time.strptime(meta["createdAt"][:19], "%Y-%m-%dT%H:%M:%S"))) / 86400
+    period = "LAST_WEEK" if age_days < 6.5 else "LAST_MONTH" if age_days < 29 else "ALL_TIME"
+    clips, after = [], None
+    for _ in range(max_pages):
+        cur = f', after:"{after}"' if after else ""
+        d = gql_query(f'query{{user(login:"{login}"){{clips(first:100{cur}, criteria:{{period:{period}, '
+                      f'sort:VIEWS_DESC}}){{edges{{cursor node{{title viewCount durationSeconds '
+                      f'videoOffsetSeconds video{{id}}}}}} pageInfo{{hasNextPage}}}}}}}}')
+        c = d["user"]["clips"]
+        for edge in c["edges"]:
+            nd = edge["node"]
+            if (nd.get("video") or {}).get("id") == vod and nd.get("videoOffsetSeconds") is not None:
+                clips.append(nd)
+        if not c["pageInfo"]["hasNextPage"] or not c["edges"] or c["edges"][-1]["node"]["viewCount"] < 20:
+            break
+        after = c["edges"][-1]["cursor"]
+    groups = []
+    for cl in sorted(clips, key=lambda c: c["videoOffsetSeconds"]):
+        a = float(cl["videoOffsetSeconds"])
+        b = a + float(cl["durationSeconds"])
+        if groups and a < groups[-1]["b"] - 5:
+            g = groups[-1]
+            g["b"] = max(g["b"], b)
+            g["clips"].append(cl)
+        else:
+            groups.append({"a": a, "b": b, "clips": [cl]})
+    moments = []
+    for g in groups:
+        top = max(g["clips"], key=lambda c: c["viewCount"])
+        a, b = g["a"], g["b"]
+        if b - a > max_len:
+            a = float(top["videoOffsetSeconds"])
+            b = a + float(top["durationSeconds"])
+        views = sum(c["viewCount"] for c in g["clips"])
+        moments.append({"s": max(0.0, a - 2), "e": min(dur, b + 1), "p": (a + b) / 2,
+                        "score": views, "views": views, "clippers": len(g["clips"]),
+                        "title": top["title"], "mode": "viewer-clips"})
+    moments.sort(key=lambda m: -m["views"])
+    return moments[:n]
 
 
 def react_score(text):
@@ -267,9 +331,13 @@ def audio_scores(loud_db, words, dur):
 
 
 # ---------------------------------------------------------------- transcription
+HALLUCINATION = re.compile(
+    r"thanks? (you )?(so much )?for watching|like and subscribe|subscribe to (my|the|our) channel|"
+    r"see you (in the )?next (video|time)|don'?t forget to (like|subscribe)|"
+    r"subtitles? (by|provided)|transcri(bed|ption) by|amara\.org", re.I)
 def transcribe(src, work, model_size, start=0.0, end=None):
     """Word list [{start,end,word}] in source time.  Cached per range."""
-    key = f"{Path(src).stem}_{model_size}_{start:.0f}_{end if end is None else round(end)}"
+    key = f"v2_{Path(src).stem}_{model_size}_{start:.0f}_{end if end is None else round(end)}"
     cache = work / f"words_{key}.json"
     if cache.exists():
         return json.loads(cache.read_text())
@@ -286,6 +354,11 @@ def transcribe(src, work, model_size, start=0.0, end=None):
                                   condition_on_previous_text=False)
     words = []
     for seg in segs:
+        # Whisper invents stock phrases over music/noise ("thanks for watching",
+        # "like and subscribe"); drop those and segments it isn't confident are speech.
+        if HALLUCINATION.search(seg.text) or (seg.no_speech_prob > 0.6 and seg.avg_logprob < -0.8):
+            print(f"  dropped likely hallucination: {seg.text.strip()[:80]!r}", flush=True)
+            continue
         for w in seg.words or []:
             words.append({"start": w.start + start, "end": w.end + start, "word": w.word,
                           "seg_start": seg.start + start, "seg_end": seg.end + start})
@@ -384,11 +457,14 @@ def video_filter(plan, W, H, ass, keep=None):
         bw, bh, bx, by = plan["cam"]
         gw = int(H * 1080 / 1312) // 2 * 2  # gameplay crop with 1080:1312 aspect
         gx = (W - gw) // 2
-        return (f"[0:v]{sel}split[a][b];[a]crop={bw}:{bh}:{bx}:{by},scale=1080:608[cam];"
-                f"[b]crop={gw}:{H}:{gx}:0,scale=1080:1312[game];"
+        # The webcam box is small in the source, so it gets the strongest upscale:
+        # lanczos + a light unsharp keeps the face crisp instead of mushy.
+        return (f"[0:v]{sel}split[a][b];[a]crop={bw}:{bh}:{bx}:{by},scale=1080:608:flags=lanczos,"
+                f"unsharp=5:5:0.8:5:5:0.0[cam];"
+                f"[b]crop={gw}:{H}:{gx}:0,scale=1080:1312:flags=lanczos,unsharp=5:5:0.4:5:5:0.0[game];"
                 f"[cam][game]vstack,setsar=1,ass='{assf}'[v]")
-    return (f"[0:v]{sel}crop={plan['crop_w']}:{H}:{plan['x']}:0,scale=1080:1920,setsar=1,"
-            f"ass='{assf}'[v]")
+    return (f"[0:v]{sel}crop={plan['crop_w']}:{H}:{plan['x']}:0,scale=1080:1920:flags=lanczos,"
+            f"unsharp=5:5:0.5:5:5:0.0,setsar=1,ass='{assf}'[v]")
 
 
 def audio_filter(keep=None):
@@ -531,6 +607,8 @@ def main():
     ap.add_argument("--scan-model", default="base", help="model for full-video scan (no-chat mode)")
     ap.add_argument("--captions", choices=sorted(PALETTE), default="color",
                     help="highlight colour: 'color' cycles yellow/green/cyan/pink/orange per caption")
+    ap.add_argument("--moments", choices=["auto", "clips", "chat"], default="auto",
+                    help="Twitch: viewer clips first then chat spikes (auto), or only one of them")
     ap.add_argument("--keep-silence", action="store_true", help="don't jump-cut dead air")
     ap.add_argument("--silence-db", type=float, default=12.0,
                     help="cut wordless pauses this many dB below the speech level (default 12)")
@@ -545,37 +623,56 @@ def main():
     heatmap = info.get("heatmap") if not vod else None
 
     # Remote sources with their own moment signal: only download the clip sections.
-    if vod or heatmap:
+    if vod:
+        dur = float(info["duration"])
+        print(f"source: {info.get('title')!r} {dur:.0f}s", flush=True)
+        moments = []
+        if args.moments in ("auto", "clips"):
+            moments = twitch_clip_moments(vod, dur, args.n)
+            print(f"viewer-clip moments: {len(moments)}", flush=True)
+        if len(moments) < args.n and args.moments in ("auto", "chat"):
+            z = robust_z(twitch_chat_profile(vod, dur, work))
+            pre, post = 30, 15
+            busy = [(m["s"], m["e"]) for m in moments]
+            zc = z.copy()
+            for a, b in busy:  # don't re-pick a moment viewers already clipped
+                zc[max(0, int(a) - 60):int(b) + 60] = -1e9
+            for p in pick_peaks(zc, args.n - len(moments), min_gap=120, dur=dur, pre=pre, post=post):
+                q = twitch_refine_peak(vod, p)
+                moments.append({"s": max(0, q - pre), "e": min(dur, q + post), "p": q,
+                                "score": round(float(z[p]), 2), "mode": "twitch-chat"})
+        moments.sort(key=lambda m: m["s"])
+        print("moments:", [(round(m["s"]), round(m["e"]), m["mode"], m.get("title", "")) for m in moments],
+              flush=True)
+        report = []
+        for n, m in enumerate(moments, 1):
+            s, e = m["s"], m["e"]
+            sec = download_section(args.source, s, e, work / f"section_{vod}_{int(s)}_{int(e)}.mp4")
+            r = render_clip(sec, 0.0, probe_duration(sec), m["p"] - s, n, out, work, args,
+                            zval=m["score"], mode=m["mode"], src_offset=s)
+            r.update({k: m[k] for k in ("title", "views", "clippers") if k in m})
+            report.append(r)
+        (out / "clips.json").write_text(json.dumps(report, indent=2))
+        return
+
+    if heatmap:
         dur = float(info["duration"])
         print(f"source: {info.get('title')!r} {dur:.0f}s", flush=True)
         pre, post = 30, 15
-        if vod:
-            z = robust_z(twitch_chat_profile(vod, dur, work))
-            rough = pick_peaks(z, args.n, min_gap=120, dur=dur, pre=pre, post=post)
-            refined = {}
-            for p in rough:
-                q = twitch_refine_peak(vod, p)
-                refined[q] = float(z[p])  # report the spike's sampled score
-            peaks = sorted(refined)
-            z = z.copy()
-            for q, zv in refined.items():
-                z[q] = zv
-            mode = "twitch-chat"
-        else:
-            grid = np.zeros(int(dur) + 1)
-            for h in heatmap:
-                grid[int(h["start_time"]):int(h["end_time"]) + 1] = h["value"]
-            z = (grid - np.median(grid)) / (np.std(grid) + 1e-6)
-            mid = [int((h["start_time"] + h["end_time"]) / 2) for h in heatmap]
-            zc = np.full_like(grid, -1e9)
-            zc[mid] = z[mid]  # only consider segment centres as peaks
-            peaks = pick_peaks(zc, args.n, min_gap=120, dur=dur, pre=pre, post=post, thresh=-1e8)
-            mode = "most-replayed"
+        grid = np.zeros(int(dur) + 1)
+        for h in heatmap:
+            grid[int(h["start_time"]):int(h["end_time"]) + 1] = h["value"]
+        z = (grid - np.median(grid)) / (np.std(grid) + 1e-6)
+        mid = [int((h["start_time"] + h["end_time"]) / 2) for h in heatmap]
+        zc = np.full_like(grid, -1e9)
+        zc[mid] = z[mid]  # only consider segment centres as peaks
+        peaks = pick_peaks(zc, args.n, min_gap=120, dur=dur, pre=pre, post=post, thresh=-1e8)
+        mode = "most-replayed"
         print(f"mode={mode} peaks={peaks} z={[round(float(z[p]), 1) for p in peaks]}", flush=True)
         report = []
         for n, p in enumerate(peaks, 1):
             s, e = max(0, p - pre), min(dur, p + post)
-            sec = download_section(args.source, s, e, work / f"section{n}.mp4")
+            sec = download_section(args.source, s, e, work / f"section_{int(s)}_{int(e)}.mp4")
             report.append(render_clip(sec, 0.0, probe_duration(sec), p - s, n, out, work, args,
                                       zval=float(z[p]), mode=mode, src_offset=s))
         (out / "clips.json").write_text(json.dumps(report, indent=2))
@@ -627,8 +724,11 @@ def render_clip(src, s, e, p, n, out, work, args, zval, mode, src_offset=0.0):
     mp4 = out / f"clip{n}_vertical.mp4"
     sh(["ffmpeg", "-y", "-v", "error", "-ss", f"{s:.2f}", "-to", f"{e:.2f}", "-i", src,
         "-filter_complex", video_filter(plan, W, H, ass, keep) + ";" + audio_filter(keep),
-        "-map", "[v]", "-map", "[a]", "-c:v", "libx264", "-preset", "medium", "-crf", "20",
-        "-pix_fmt", "yuv420p", "-r", "30", "-c:a", "aac", "-b:a", "160k", "-ar", "48000",
+        # one high-quality encode at the source frame rate (60 fps stays 60);
+        # the bitrate cap keeps phone downloads sane without a second lossy pass
+        "-map", "[v]", "-map", "[a]", "-c:v", "libx264", "-preset", "slow", "-crf", "18",
+        "-maxrate", "12M", "-bufsize", "24M", "-profile:v", "high",
+        "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k", "-ar", "48000",
         "-movflags", "+faststart", mp4])
     thumb = out / f"clip{n}_frame.jpg"
     sh(["ffmpeg", "-y", "-v", "error", "-ss", f"{max(0.5, remap(p - s)):.2f}", "-i", mp4, "-frames:v", "1", thumb])
