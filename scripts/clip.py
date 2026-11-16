@@ -26,8 +26,12 @@ Framing (OpenCV face detection on sampled frames of each clip):
                                               the median face position (or the
                                               frame centre when there is none)
 
+Silence: wordless pauses >= 0.4 s that sit 12 dB+ below the speech level are
+jump-cut out (--keep-silence to disable); captions are re-timed to match.
+
 Captions: faster-whisper word timestamps -> ASS, 3-word pages, active word
-highlighted yellow and scaled up, burned in with libass.
+scaled up and coloured, cycling yellow/green/cyan/pink/orange per page
+(--captions yellow for a single colour), burned in with libass.
 """
 import argparse, json, os, re, subprocess, sys, time, urllib.request
 from concurrent.futures import ThreadPoolExecutor
@@ -368,17 +372,92 @@ def plan_framing(src, start, end, W, H):
     return {"mode": "crop", "x": x, "crop_w": crop_w, "faces": len(largest)}
 
 
-def video_filter(plan, W, H, ass):
+def keep_expr(keep):
+    return "+".join(f"between(t,{a:.3f},{b:.3f})" for a, b in keep)
+
+
+def video_filter(plan, W, H, ass, keep=None):
     assf = str(ass).replace("\\", "/").replace(":", r"\:")
+    # Jump cuts happen first, so the captions (already re-timed) line up after them.
+    sel = f"select='{keep_expr(keep)}',setpts=N/FRAME_RATE/TB," if keep else ""
     if plan["mode"] == "stack":
         bw, bh, bx, by = plan["cam"]
         gw = int(H * 1080 / 1312) // 2 * 2  # gameplay crop with 1080:1312 aspect
         gx = (W - gw) // 2
-        return (f"[0:v]split[a][b];[a]crop={bw}:{bh}:{bx}:{by},scale=1080:608[cam];"
+        return (f"[0:v]{sel}split[a][b];[a]crop={bw}:{bh}:{bx}:{by},scale=1080:608[cam];"
                 f"[b]crop={gw}:{H}:{gx}:0,scale=1080:1312[game];"
                 f"[cam][game]vstack,setsar=1,ass='{assf}'[v]")
-    return (f"[0:v]crop={plan['crop_w']}:{H}:{plan['x']}:0,scale=1080:1920,setsar=1,"
+    return (f"[0:v]{sel}crop={plan['crop_w']}:{H}:{plan['x']}:0,scale=1080:1920,setsar=1,"
             f"ass='{assf}'[v]")
+
+
+def audio_filter(keep=None):
+    sel = f"aselect='{keep_expr(keep)}',asetpts=N/SR/TB," if keep else ""
+    return f"[0:a]{sel}loudnorm=I=-14:TP=-1:LRA=11[a]"
+
+
+# ---------------------------------------------------------------- silence cutting
+def find_keep(src, s, e, words, drop_db=12.0, min_sil=0.4, pad=0.15):
+    """Clip-local [a, b] spans to keep after removing dead air.
+
+    A pause is cut when it has no transcribed words, lasts >= min_sil and is
+    at least drop_db quieter than the clip's median speech level, so loud
+    non-speech moments (screams, hype music) stay in.  Returns None when
+    nothing worth cutting is found."""
+    raw = subprocess.run(["ffmpeg", "-v", "error", "-ss", f"{s:.3f}", "-to", f"{e:.3f}", "-i", str(src),
+                          "-vn", "-ac", "1", "-ar", "16000", "-f", "f32le", "-"],
+                         capture_output=True, check=True).stdout
+    a = np.frombuffer(raw, np.float32)
+    F, step = 800, 0.05  # 50 ms frames
+    k = len(a) // F
+    if k < 10:
+        return None
+    db = 20 * np.log10(np.sqrt((a[:k * F].reshape(k, F) ** 2).mean(1)) + 1e-9)
+    speech = np.zeros(k, bool)
+    p = int(round(pad / step))
+    for w in words:
+        i0, i1 = int((w["start"] - s) / step) - p, int((w["end"] - s) / step) + p + 1
+        speech[max(0, i0):max(0, min(k, i1))] = True
+    level = np.median(db[speech]) if speech.any() else np.percentile(db, 75)
+    quiet = (db < level - drop_db) & ~speech
+    cuts, i = [], 0
+    while i < k:
+        if quiet[i]:
+            j = i
+            while j < k and quiet[j]:
+                j += 1
+            if (j - i) * step >= min_sil:
+                cuts.append((i * step + (pad if i else 0), j * step - (pad if j < k else 0)))
+            i = j
+        else:
+            i += 1
+    cuts = [(c0, c1) for c0, c1 in cuts if c1 - c0 >= 0.2]
+    if not cuts:
+        return None
+    keep, t = [], 0.0
+    for c0, c1 in cuts:
+        if c0 > t:
+            keep.append((t, c0))
+        t = c1
+    if t < k * step:
+        keep.append((t, k * step))
+    return keep or None
+
+
+def remap_fn(keep):
+    """Map clip-local time to the jump-cut timeline (times inside a cut snap to it)."""
+    if not keep:
+        return lambda t: t
+    starts = np.array([a for a, _ in keep])
+    ends = np.array([b for _, b in keep])
+    offs = np.concatenate([[0.0], np.cumsum(ends - starts)[:-1]])
+
+    def f(t):
+        i = int(np.searchsorted(starts, t, side="right")) - 1
+        if i < 0:
+            return 0.0
+        return float(offs[i] + min(t, ends[i]) - starts[i])
+    return f
 
 
 # ---------------------------------------------------------------- captions
@@ -391,7 +470,15 @@ def ass_escape(s):
     return s.replace("\\", "").replace("{", "(").replace("}", ")")
 
 
-def write_ass(path, words, clip_start, clip_end, y):
+# Highlight colour for the spoken word, cycling per caption page (ASS is &HBBGGRR&).
+PALETTE = {
+    "color": ["&H00E5FF&", "&H3CFF3C&", "&HFFE500&", "&HA040FF&", "&H008CFF&"],  # yellow, green, cyan, pink, orange
+    "yellow": ["&H00E5FF&"],
+}
+
+
+def write_ass(path, words, clip_start, clip_end, y, remap=None, palette=PALETTE["color"]):
+    remap = remap or (lambda t: t)
     hdr = f"""[Script Info]
 ScriptType: v4.00+
 PlayResX: 1080
@@ -405,7 +492,7 @@ Style: Cap,{FONT},88,&H00FFFFFF,&H00FFFFFF,&H00000000,&H80000000,-1,0,0,0,100,10
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 """
-    ws = [dict(w, start=w["start"] - clip_start, end=w["end"] - clip_start) for w in words
+    ws = [dict(w, start=remap(w["start"] - clip_start), end=remap(w["end"] - clip_start)) for w in words
           if w["end"] > clip_start and w["start"] < clip_end]
     pages, cur = [], []
     for w in ws:  # 3 words per page; break early on long gaps or sentence ends
@@ -420,12 +507,13 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     for pi, page in enumerate(pages):
         page_end = min(page[-1]["end"] + 0.3, pages[pi + 1][0]["start"] if pi + 1 < len(pages) else 1e9)
         toks = [ass_escape(w["word"].strip().upper()) for w in page]
+        col = palette[pi % len(palette)]
         for j, w in enumerate(page):
             s = w["start"]
             e = page[j + 1]["start"] if j + 1 < len(page) else page_end
             if e <= s:
                 continue
-            txt = " ".join((r"{\c&H00E5FF&\fscx118\fscy118}" + x + r"{\r}") if k == j else x
+            txt = " ".join((rf"{{\c{col}\fscx118\fscy118}}" + x + r"{\r}") if k == j else x
                            for k, x in enumerate(toks))
             lines.append(f"Dialogue: 0,{ass_time(s)},{ass_time(e)},Cap,,0,0,0,,{{\\pos(540,{y})}}{txt}")
     path.write_text(hdr + "\n".join(lines) + "\n")
@@ -441,6 +529,11 @@ def main():
     ap.add_argument("--out", default="out")
     ap.add_argument("--model", default="small", help="faster-whisper model for clip captions")
     ap.add_argument("--scan-model", default="base", help="model for full-video scan (no-chat mode)")
+    ap.add_argument("--captions", choices=sorted(PALETTE), default="color",
+                    help="highlight colour: 'color' cycles yellow/green/cyan/pink/orange per caption")
+    ap.add_argument("--keep-silence", action="store_true", help="don't jump-cut dead air")
+    ap.add_argument("--silence-db", type=float, default=12.0,
+                    help="cut wordless pauses this many dB below the speech level (default 12)")
     args = ap.parse_args()
 
     out = Path(args.out)
@@ -526,20 +619,25 @@ def render_clip(src, s, e, p, n, out, work, args, zval, mode, src_offset=0.0):
     W, H = probe_size(src)
     words = transcribe(src, work, args.model, s, e)
     plan = plan_framing(src, s, e, W, H)
+    keep = None if args.keep_silence else find_keep(src, s, e, words, drop_db=args.silence_db)
+    remap = remap_fn(keep)
     ass = work / f"clip{n}.ass"
-    nw = write_ass(ass, words, s, e, y=1460 if plan["mode"] == "crop" else 1180)
+    nw = write_ass(ass, words, s, e, y=1460 if plan["mode"] == "crop" else 1180,
+                   remap=remap, palette=PALETTE[args.captions])
     mp4 = out / f"clip{n}_vertical.mp4"
     sh(["ffmpeg", "-y", "-v", "error", "-ss", f"{s:.2f}", "-to", f"{e:.2f}", "-i", src,
-        "-filter_complex", video_filter(plan, W, H, ass) + ";[0:a]loudnorm=I=-14:TP=-1:LRA=11[a]",
+        "-filter_complex", video_filter(plan, W, H, ass, keep) + ";" + audio_filter(keep),
         "-map", "[v]", "-map", "[a]", "-c:v", "libx264", "-preset", "medium", "-crf", "20",
         "-pix_fmt", "yuv420p", "-r", "30", "-c:a", "aac", "-b:a", "160k", "-ar", "48000",
         "-movflags", "+faststart", mp4])
     thumb = out / f"clip{n}_frame.jpg"
-    sh(["ffmpeg", "-y", "-v", "error", "-ss", f"{max(0.5, p - s):.2f}", "-i", mp4, "-frames:v", "1", thumb])
+    sh(["ffmpeg", "-y", "-v", "error", "-ss", f"{max(0.5, remap(p - s)):.2f}", "-i", mp4, "-frames:v", "1", thumb])
     text = " ".join(w["word"].strip() for w in words if s <= w["start"] < e)
+    final = probe_duration(mp4)
     info = {"clip": mp4.name, "start": round(s + src_offset, 2), "end": round(e + src_offset, 2),
             "peak": round(p + src_offset, 2), "z": round(zval, 2), "mode": mode, "framing": plan["mode"],
-            "faces_sampled": plan["faces"], "caption_words": nw, "transcript": text}
+            "faces_sampled": plan["faces"], "caption_words": nw,
+            "silence_cut_s": round((e - s) - final, 1), "duration": round(final, 1), "transcript": text}
     print(json.dumps({k: v for k, v in info.items() if k != "transcript"}), flush=True)
     return info
 
