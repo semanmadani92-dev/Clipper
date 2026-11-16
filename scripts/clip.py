@@ -3,12 +3,19 @@
 Usage:
     python scripts/clip.py SOURCE [--chat CHAT.json] [-n 3] [--out out/]
 
-SOURCE is a local video file or a URL (downloaded with yt-dlp).
+SOURCE is a local video file or a URL (yt-dlp).
 
 Moment selection:
-  * Twitch VOD URL, or --chat given: chat spikes (unique chatters per 10 s plus
-    emote reactions, robust z-score against a trailing 5 min baseline).  Each
-    clip starts 30 s before the spike peak and ends 15 s after it.
+  * Twitch VOD URL: chat replay is pulled straight from Twitch's public GraphQL
+    API.  The whole VOD is sampled every 10 s in parallel (rate of unique
+    chatters + emote reactions), the top spikes are picked by robust z-score
+    against a trailing 5 min baseline, then every message around each spike
+    is paged in to pin the peak to the second.  Only the clip sections are
+    downloaded (start 30 s before the peak, end 15 s after), so multi-hour
+    VODs are fine.
+  * --chat CHAT.json with a local file: same spike logic on a saved chat log.
+  * URL whose metadata has YouTube's "Most replayed" heatmap: the top heatmap
+    segments, section-downloaded.
   * Otherwise: audio excitement (loudness z-score, boosted by speech rate and
     shouty transcript words).  Each clip runs ~20 s before to ~15 s after the
     peak, snapped to sentence boundaries.
@@ -22,7 +29,8 @@ Framing (OpenCV face detection on sampled frames of each clip):
 Captions: faster-whisper word timestamps -> ASS, 3-word pages, active word
 highlighted yellow and scaled up, burned in with libass.
 """
-import argparse, json, re, subprocess, sys
+import argparse, json, os, re, subprocess, sys, time, urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import cv2
@@ -53,24 +61,125 @@ def probe_size(path):
 
 
 # ---------------------------------------------------------------- acquisition
-def is_twitch_vod(src):
-    return bool(re.search(r"twitch\.tv/(videos/\d+|\w+/v/\d+)", src))
+FMT = "bv*[height<=1080]+ba/b[height<=1080]/b"
+
+
+def twitch_vod_id(src):
+    m = re.search(r"twitch\.tv/(?:videos/|\w+/v/)(\d+)", src)
+    return m.group(1) if m else None
+
+
+def ytdlp_proxy_args():
+    # yt-dlp honours HTTPS_PROXY itself, but the ffmpeg it spawns for section
+    # downloads does not; hand the proxy to ffmpeg explicitly when there is one.
+    p = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy")
+    return ["--downloader-args", f"ffmpeg_i:-http_proxy {p}"] if p else []
+
+
+def ytdlp_info(url):
+    r = subprocess.run(["yt-dlp", "-J", "--no-playlist", "--skip-download", url],
+                       capture_output=True, text=True, check=True)
+    return json.loads(r.stdout)
 
 
 def fetch(src, work):
     if Path(src).exists():
         return Path(src)
     out = work / "source.%(ext)s"
-    sh(["yt-dlp", "--no-playlist", "-f", "bv*[height<=1080]+ba/b[height<=1080]/b",
-        "--merge-output-format", "mp4", "-o", out, src])
+    sh(["yt-dlp", "--no-playlist", "-f", FMT, "--merge-output-format", "mp4", "-o", out, src])
     return next(work.glob("source.*"))
 
 
-def fetch_twitch_chat(src, work):
-    path = work / "chat.json"
-    if not path.exists():
-        sh(["chat_downloader", src, "--output", path, "--quiet"])
+def download_section(url, s, e, path):
+    if path.exists():
+        return path
+    sh(["yt-dlp", "--no-playlist", "-f", FMT, "--download-sections", f"*{s:.2f}-{e:.2f}",
+        "--merge-output-format", "mp4", *ytdlp_proxy_args(), "-o", path, url])
     return path
+
+
+# Twitch chat replay via the public GraphQL endpoint the web player uses.
+GQL_URL = "https://gql.twitch.tv/gql"
+GQL_CLIENT_ID = "kimne78kx3ncx6brgo4mv6wki5h1ko"
+GQL_COMMENTS_HASH = "b70a3591ff0f4e0313d126c6a1502d79a1c02baebb288227c582044aa76adf6a"
+
+
+def gql_comments(vod, offset=None, cursor=None):
+    """One page (~50 msgs) of chat: ([(t, user, text)], next_cursor or None)."""
+    var = {"videoID": vod}
+    if cursor:
+        var["cursor"] = cursor
+    else:
+        var["contentOffsetSeconds"] = int(offset)
+    body = json.dumps([{"operationName": "VideoCommentsByOffsetOrCursor", "variables": var,
+                        "extensions": {"persistedQuery": {"version": 1, "sha256Hash": GQL_COMMENTS_HASH}}}])
+    for attempt in range(5):
+        try:
+            req = urllib.request.Request(GQL_URL, body.encode(), {
+                "Client-Id": GQL_CLIENT_ID, "Content-Type": "application/json"})
+            data = json.load(urllib.request.urlopen(req, timeout=20))[0]["data"]["video"]["comments"]
+            break
+        except Exception:
+            if attempt == 4:
+                raise
+            time.sleep(1.5 * 2 ** attempt)
+    if not data:
+        return [], None
+    msgs = []
+    for edge in data["edges"]:
+        n = edge["node"]
+        text = "".join(f.get("text", "") for f in (n.get("message") or {}).get("fragments") or [])
+        user = (n.get("commenter") or {}).get("login", "?")
+        msgs.append((float(n["contentOffsetSeconds"]), user, text))
+    nxt = data["edges"][-1]["cursor"] if data["edges"] and data["pageInfo"]["hasNextPage"] else None
+    return msgs, nxt
+
+
+def react_score(text):
+    return sum(REACT.get(tok, 0) for tok in text.split())
+
+
+def twitch_chat_profile(vod, dur, work, step=10, workers=16):
+    """Per-second chat score for the whole VOD from one chat page every `step` s."""
+    cache = work / f"chat_profile_{vod}_{step}.json"
+    if cache.exists():
+        samples = json.loads(cache.read_text())
+    else:
+        offsets = list(range(0, int(dur), step))
+
+        def sample(off):
+            msgs, _ = gql_comments(vod, offset=off)
+            msgs = [m for m in msgs if m[0] >= off - 1]
+            if not msgs:
+                return [off, 0.0, 0.0]
+            span = max(msgs[-1][0] - msgs[0][0], 1.0)
+            return [off, len({u for _, u, _ in msgs}) / span, sum(react_score(t) for *_, t in msgs) / span]
+
+        t0 = time.time()
+        with ThreadPoolExecutor(workers) as ex:
+            samples = list(ex.map(sample, offsets))
+        print(f"  chat: sampled {len(samples)} points in {time.time() - t0:.0f}s", flush=True)
+        cache.write_text(json.dumps(samples))
+    s = np.array(samples, float)
+    grid = np.arange(int(dur) + 1)
+    W = 10  # same scale as "unique chatters per 10 s"
+    return np.interp(grid, s[:, 0], W * s[:, 1] + 0.3 * W * s[:, 2])
+
+
+def twitch_refine_peak(vod, p, before=40, after=25, max_pages=400):
+    """Page every message in [p-before, p+after] and return the busiest second."""
+    msgs, cur = gql_comments(vod, offset=max(0, p - before))
+    pages = 1
+    while cur and msgs and msgs[-1][0] < p + after and pages < max_pages:
+        more, cur = gql_comments(vod, cursor=cur)
+        msgs += more
+        pages += 1
+    lo = max(0, p - before)
+    local = [(t - lo, u, x) for t, u, x in msgs if lo <= t <= p + after]
+    if not local:
+        return p
+    sc = chat_scores(local, before + after)
+    return int(lo + int(np.argmax(sc)))
 
 
 def load_chat(path):
@@ -119,7 +228,7 @@ def chat_scores(chat, dur):
         s = int(t)
         if 0 <= s < D:
             users[s].add(u)
-            react[s] += sum(REACT.get(tok, 0) for tok in text.split())
+            react[s] += react_score(text)
     W = 10
     uniq = np.array([len(set().union(*users[max(0, i - W + 1):i + 1])) for i in range(D)], float)
     return uniq + 0.3 * np.convolve(react, np.ones(W), "full")[:D]
@@ -156,7 +265,7 @@ def audio_scores(loud_db, words, dur):
 # ---------------------------------------------------------------- transcription
 def transcribe(src, work, model_size, start=0.0, end=None):
     """Word list [{start,end,word}] in source time.  Cached per range."""
-    key = f"{model_size}_{start:.0f}_{end if end is None else round(end)}"
+    key = f"{Path(src).stem}_{model_size}_{start:.0f}_{end if end is None else round(end)}"
     cache = work / f"words_{key}.json"
     if cache.exists():
         return json.loads(cache.read_text())
@@ -319,14 +428,47 @@ def main():
     out = Path(args.out)
     work = out / "work"
     work.mkdir(parents=True, exist_ok=True)
+    is_url = not Path(args.source).exists()
+    vod = twitch_vod_id(args.source) if is_url else None
+    info = ytdlp_info(args.source) if is_url and not args.chat else {}
+    heatmap = info.get("heatmap") if not vod else None
+
+    # Remote sources with their own moment signal: only download the clip sections.
+    if vod or heatmap:
+        dur = float(info["duration"])
+        print(f"source: {info.get('title')!r} {dur:.0f}s", flush=True)
+        pre, post = 30, 15
+        if vod:
+            z = robust_z(twitch_chat_profile(vod, dur, work))
+            rough = pick_peaks(z, args.n, min_gap=120, dur=dur, pre=pre, post=post)
+            peaks = sorted(twitch_refine_peak(vod, p) for p in rough)
+            mode = "twitch-chat"
+        else:
+            grid = np.zeros(int(dur) + 1)
+            for h in heatmap:
+                grid[int(h["start_time"]):int(h["end_time"]) + 1] = h["value"]
+            z = (grid - np.median(grid)) / (np.std(grid) + 1e-6)
+            mid = [int((h["start_time"] + h["end_time"]) / 2) for h in heatmap]
+            zc = np.full_like(grid, -1e9)
+            zc[mid] = z[mid]  # only consider segment centres as peaks
+            peaks = pick_peaks(zc, args.n, min_gap=120, dur=dur, pre=pre, post=post, thresh=-1e8)
+            mode = "most-replayed"
+        print(f"mode={mode} peaks={peaks} z={[round(float(z[p]), 1) for p in peaks]}", flush=True)
+        report = []
+        for n, p in enumerate(peaks, 1):
+            s, e = max(0, p - pre), min(dur, p + post)
+            sec = download_section(args.source, s, e, work / f"section{n}.mp4")
+            report.append(render_clip(sec, 0.0, probe_duration(sec), p - s, n, out, work, args,
+                                      zval=float(z[p]), mode=mode, src_offset=s))
+        (out / "clips.json").write_text(json.dumps(report, indent=2))
+        return
+
     src = fetch(args.source, work)
     dur = probe_duration(src)
-    W, H = probe_size(src)
-    print(f"source: {src} {W}x{H} {dur:.0f}s", flush=True)
+    print(f"source: {src} {dur:.0f}s", flush=True)
 
-    chat_path = args.chat or (fetch_twitch_chat(args.source, work) if is_twitch_vod(args.source) else None)
-    if chat_path:
-        chat = load_chat(chat_path)
+    if args.chat:
+        chat = load_chat(args.chat)
         print(f"chat: {len(chat)} messages", flush=True)
         z = robust_z(chat_scores(chat, dur))
         pre, post = 30, 15
@@ -348,27 +490,33 @@ def main():
         mode = "audio"
     print(f"mode={mode} peaks={peaks} z={[round(float(z[p]), 1) for p in peaks]}", flush=True)
 
-    report = []
-    for n, (s, e, p) in enumerate(windows, 1):
-        words = transcribe(src, work, args.model, s, e)
-        plan = plan_framing(src, s, e, W, H)
-        ass = work / f"clip{n}.ass"
-        nw = write_ass(ass, words, s, e, y=1460 if plan["mode"] == "crop" else 1180)
-        mp4 = out / f"clip{n}_vertical.mp4"
-        sh(["ffmpeg", "-y", "-v", "error", "-ss", f"{s:.2f}", "-to", f"{e:.2f}", "-i", src,
-            "-filter_complex", video_filter(plan, W, H, ass) + ";[0:a]loudnorm=I=-14:TP=-1:LRA=11[a]",
-            "-map", "[v]", "-map", "[a]", "-c:v", "libx264", "-preset", "medium", "-crf", "20",
-            "-pix_fmt", "yuv420p", "-r", "30", "-c:a", "aac", "-b:a", "160k", "-ar", "48000",
-            "-movflags", "+faststart", mp4])
-        thumb = out / f"clip{n}_frame.jpg"
-        sh(["ffmpeg", "-y", "-v", "error", "-ss", f"{max(0.5, p - s):.2f}", "-i", mp4, "-frames:v", "1", thumb])
-        text = " ".join(w["word"].strip() for w in words if s <= w["start"] < e)
-        info = {"clip": mp4.name, "start": round(s, 2), "end": round(e, 2), "peak": p,
-                "z": round(float(z[p]), 2), "mode": mode, "framing": plan["mode"],
-                "faces_sampled": plan["faces"], "caption_words": nw, "transcript": text}
-        report.append(info)
-        print(json.dumps({k: v for k, v in info.items() if k != "transcript"}), flush=True)
+    report = [render_clip(src, s, e, p, n, out, work, args, zval=float(z[p]), mode=mode)
+              for n, (s, e, p) in enumerate(windows, 1)]
     (out / "clips.json").write_text(json.dumps(report, indent=2))
+
+
+def render_clip(src, s, e, p, n, out, work, args, zval, mode, src_offset=0.0):
+    """Render [s, e] of src as clip n; p is the peak in src time. Times in the
+    report are shifted by src_offset back to the original video's timeline."""
+    W, H = probe_size(src)
+    words = transcribe(src, work, args.model, s, e)
+    plan = plan_framing(src, s, e, W, H)
+    ass = work / f"clip{n}.ass"
+    nw = write_ass(ass, words, s, e, y=1460 if plan["mode"] == "crop" else 1180)
+    mp4 = out / f"clip{n}_vertical.mp4"
+    sh(["ffmpeg", "-y", "-v", "error", "-ss", f"{s:.2f}", "-to", f"{e:.2f}", "-i", src,
+        "-filter_complex", video_filter(plan, W, H, ass) + ";[0:a]loudnorm=I=-14:TP=-1:LRA=11[a]",
+        "-map", "[v]", "-map", "[a]", "-c:v", "libx264", "-preset", "medium", "-crf", "20",
+        "-pix_fmt", "yuv420p", "-r", "30", "-c:a", "aac", "-b:a", "160k", "-ar", "48000",
+        "-movflags", "+faststart", mp4])
+    thumb = out / f"clip{n}_frame.jpg"
+    sh(["ffmpeg", "-y", "-v", "error", "-ss", f"{max(0.5, p - s):.2f}", "-i", mp4, "-frames:v", "1", thumb])
+    text = " ".join(w["word"].strip() for w in words if s <= w["start"] < e)
+    info = {"clip": mp4.name, "start": round(s + src_offset, 2), "end": round(e + src_offset, 2),
+            "peak": round(p + src_offset, 2), "z": round(zval, 2), "mode": mode, "framing": plan["mode"],
+            "faces_sampled": plan["faces"], "caption_words": nw, "transcript": text}
+    print(json.dumps({k: v for k, v in info.items() if k != "transcript"}), flush=True)
+    return info
 
 
 if __name__ == "__main__":
