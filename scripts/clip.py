@@ -3,7 +3,21 @@
 Usage:
     python scripts/clip.py SOURCE [--chat CHAT.json] [-n 3] [--out out/]
 
+    # Twitch, editor-in-the-loop (the editor can be a person or an LLM):
+    python scripts/clip.py TWITCH_VOD_URL --candidates 8 --out out/   # -> out/candidates.json
+    #   read the transcripts, write plan.json:
+    #   [{"id": 3, "name": "slug", "start": 5177.0, "end": 5221.0,
+    #     "hook": "Speed's friend tries to expose him", "teaser": [5203.4, 5206.1]}]
+    python scripts/clip.py TWITCH_VOD_URL --plan plan.json --out out/
+
 SOURCE is a local video file or a URL (yt-dlp).
+
+Viral format (default; --plain turns it off): hook title in a white box
+(top, or a title bar across the cam/gameplay seam), Anton captions with the
+active word popping in, punch-in zooms on the loudest reactions, a progress
+bar, and an optional cold-open teaser of the payoff.  On Twitch the
+streamer is recognised by face (the identity present in most moments) so
+multi-cam squad layouts keep the right person on top.
 
 Moment selection:
   * Twitch VOD URL: chat replay is pulled straight from Twitch's public GraphQL
@@ -380,42 +394,125 @@ def snap(words, t, direction, limit):
 _FACE = None
 
 
-def detect_faces(frame):
-    """YuNet face detector (OpenCV 5 dropped Haar cascades); model fetched from Hugging Face."""
+_REC = None
+
+
+def _hf(repo, name):
+    from huggingface_hub import hf_hub_download
+    return hf_hub_download(repo, name)
+
+
+def detect_faces(frame, rows=False):
+    """YuNet face detector (OpenCV 5 dropped Haar cascades); model fetched from Hugging Face.
+    Runs at full resolution so small webcam faces are still recognisable.
+    Returns boxes, or the raw YuNet rows (box + landmarks) with rows=True."""
     global _FACE
     if _FACE is None:
-        from huggingface_hub import hf_hub_download
-        model = hf_hub_download("opencv/face_detection_yunet", "face_detection_yunet_2023mar.onnx")
-        _FACE = cv2.FaceDetectorYN.create(model, "", (320, 320), 0.7, 0.3, 50)
-    scale = 640 / frame.shape[1]
-    small = cv2.resize(frame, None, fx=scale, fy=scale)
-    _FACE.setInputSize((small.shape[1], small.shape[0]))
-    _, faces = _FACE.detect(small)
+        _FACE = cv2.FaceDetectorYN.create(_hf("opencv/face_detection_yunet",
+                                              "face_detection_yunet_2023mar.onnx"), "", (320, 320), 0.7, 0.3, 50)
+    _FACE.setInputSize((frame.shape[1], frame.shape[0]))
+    _, faces = _FACE.detect(frame)
     if faces is None:
         return []
-    return [(x / scale, y / scale, w / scale, h / scale) for x, y, w, h in faces[:, :4]]
+    faces = [f for f in faces if f[2] >= 24]
+    return faces if rows else [tuple(float(v) for v in f[:4]) for f in faces]
 
 
-def plan_framing(src, start, end, W, H):
+def face_feature(frame, row):
+    """Unit-length SFace identity embedding for one detected face."""
+    global _REC
+    if _REC is None:
+        _REC = cv2.FaceRecognizerSF.create(_hf("opencv/face_recognition_sface",
+                                               "face_recognition_sface_2021dec.onnx"), "")
+    f = _REC.feature(_REC.alignCrop(frame, row)).ravel()
+    return f / (np.linalg.norm(f) + 1e-9)
+
+
+def streamer_reference(sections, cache=None, per_section=8, same=0.40):
+    """Identity embedding of the streamer: the face seen in the most of the
+    given moments (guests and on-screen faces come and go; the streamer's cam
+    is in nearly all of them).  None when no face is clearly recurrent."""
+    if cache and Path(cache).exists():
+        return np.load(cache)
+    clusters = []  # [feature sum, count, set of section indices]
+    for si, sec in enumerate(sections):
+        cap = cv2.VideoCapture(str(sec))
+        dur = cap.get(cv2.CAP_PROP_FRAME_COUNT) / max(cap.get(cv2.CAP_PROP_FPS), 1)
+        for t in np.linspace(1, max(1.5, dur - 1), per_section):
+            cap.set(cv2.CAP_PROP_POS_MSEC, t * 1000)
+            ok, fr = cap.read()
+            if not ok:
+                continue
+            for row in detect_faces(fr, rows=True):
+                if row[2] < 40:
+                    continue
+                f = face_feature(fr, row)
+                sims = [float(c[0] @ f / np.linalg.norm(c[0])) for c in clusters]
+                if sims and max(sims) > same:
+                    c = clusters[int(np.argmax(sims))]
+                    c[0] += f
+                    c[1] += 1
+                    c[2].add(si)
+                else:
+                    clusters.append([f.copy(), 1, {si}])
+        cap.release()
+    if len(sections) < 2 or not clusters:
+        return None
+    clusters.sort(key=lambda c: (-len(c[2]), -c[1]))
+    top = clusters[0]
+    if len(top[2]) < max(2, 0.6 * len(sections)):
+        return None
+    ref = top[0] / np.linalg.norm(top[0])
+    print(f"  streamer face: seen in {len(top[2])}/{len(sections)} moments", flush=True)
+    if cache:
+        np.save(cache, ref)
+    return ref
+
+
+def plan_framing(src, start, end, W, H, ref=None, match=0.30):
     cap = cv2.VideoCapture(str(src))
-    frames = []
+    frames, feats = [], []
     for t in np.linspace(start + 0.5, end - 0.5, 24):
         cap.set(cv2.CAP_PROP_POS_MSEC, t * 1000)
         ok, frame = cap.read()
         if ok:
-            frames.append(detect_faces(frame))
+            rows = detect_faces(frame, rows=True)
+            frames.append([tuple(float(v) for v in r[:4]) for r in rows])
+            if ref is not None:
+                feats.append([float(face_feature(frame, r) @ ref) if r[2] >= 30 else -1.0 for r in rows])
     cap.release()
-    # Track the face seen in the most frames at the same spot (the streamer),
+    found = []
+    if ref is not None:
+        # Known streamer identity: follow whichever face is them (multi-cam layouts).
+        # Every match counts (the streamer can also appear inside on-screen media,
+        # e.g. a fan edit of them); keep the biggest group at one fixed spot,
+        # which is their live cam, when it covers most frames.
+        hits = [f for fs, ss in zip(frames, feats) for f, s in zip(fs, ss) if s > match]
+        tol_m = 0.04 * W
+        groups = []
+        for f in hits:
+            cx = f[0] + f[2] / 2
+            for g in groups:
+                if abs(g[0] - cx) < tol_m and 0.6 < f[2] / g[1] < 1.6:
+                    g[2].append(f)
+                    break
+            else:
+                groups.append([cx, f[2], [f]])
+        groups.sort(key=lambda g: -len(g[2]))
+        if groups and len(groups[0][2]) >= 8:
+            found = groups[0][2]
+        elif len(hits) >= 8:
+            found = hits
+    # Otherwise track the face seen in the most frames at the same spot,
     # not just the largest one: on-screen photos/videos add short-lived faces.
     tol = 0.04 * W
     best, best_n = None, 0
-    for cand in (f for fs in frames for f in fs):
+    for cand in ([] if found else (f for fs in frames for f in fs)):
         ccx = cand[0] + cand[2] / 2
         n_hit = sum(any(abs(f[0] + f[2] / 2 - ccx) < tol and 0.6 < f[2] / cand[2] < 1.6 for f in fs)
                     for fs in frames)
         if n_hit > best_n or (n_hit == best_n and best is not None and cand[2] > best[2]):
             best, best_n = cand, n_hit
-    found = []
     if best is not None:
         bcx = best[0] + best[2] / 2
         for fs in frames:
@@ -437,7 +534,7 @@ def plan_framing(src, start, end, W, H):
         by = int(np.clip(cy - bh / 2, 0, H - bh)) // 2 * 2
         return {"mode": "stack", "cam": (bw, bh, bx, by), "faces": len(found)}
     # Full-frame camera: centre the crop on the largest face per frame (it moves around).
-    largest = [max(fs, key=lambda f: f[2] * f[3]) for fs in frames if fs]
+    largest = found if (ref is not None and found) else [max(fs, key=lambda f: f[2] * f[3]) for fs in frames if fs]
     if len(largest) < 4:
         return {"mode": "crop", "x": (W - crop_w) // 2, "crop_w": crop_w, "faces": len(largest)}
     cx = np.median([f[0] + f[2] / 2 for f in largest])
@@ -445,12 +542,25 @@ def plan_framing(src, start, end, W, H):
     return {"mode": "crop", "x": x, "crop_w": crop_w, "faces": len(largest)}
 
 
-def keep_expr(keep):
-    return "+".join(f"between(t,{a:.3f},{b:.3f})" for a, b in keep)
+def keep_expr(keep, var="t"):
+    return "+".join(f"between({var},{a:.3f},{b:.3f})" for a, b in keep)
 
 
-def video_filter(plan, W, H, ass, keep=None):
+FONTS_DIR = Path(__file__).resolve().parent.parent / "assets" / "fonts"
+ZOOM = 1.18  # punch-in factor
+
+
+def zoompan(zooms, size, fps, cy=0.5):
+    """Hard punch-in during the given output-time windows (centre cy of the height)."""
+    if not zooms:
+        return ""
+    z = f"if({keep_expr(zooms, 'it')},{ZOOM},1)"
+    return (f",zoompan=z='{z}':x='iw/2-iw/zoom/2':y='ih*{cy}-ih/zoom*{cy}':d=1:s={size}:fps={fps}")
+
+
+def video_filter(plan, W, H, ass, keep=None, zooms=None, fps=60, bar_dur=None):
     assf = str(ass).replace("\\", "/").replace(":", r"\:")
+    fontsf = str(FONTS_DIR).replace("\\", "/").replace(":", r"\:")
     # Jump cuts happen first, so the captions (already re-timed) line up after them.
     sel = f"select='{keep_expr(keep)}',setpts=N/FRAME_RATE/TB," if keep else ""
     if plan["mode"] == "stack":
@@ -459,12 +569,21 @@ def video_filter(plan, W, H, ass, keep=None):
         gx = (W - gw) // 2
         # The webcam box is small in the source, so it gets the strongest upscale:
         # lanczos + a light unsharp keeps the face crisp instead of mushy.
-        return (f"[0:v]{sel}split[a][b];[a]crop={bw}:{bh}:{bx}:{by},scale=1080:608:flags=lanczos,"
-                f"unsharp=5:5:0.8:5:5:0.0[cam];"
-                f"[b]crop={gw}:{H}:{gx}:0,scale=1080:1312:flags=lanczos,unsharp=5:5:0.4:5:5:0.0[game];"
-                f"[cam][game]vstack,setsar=1,ass='{assf}'[v]")
-    return (f"[0:v]{sel}crop={plan['crop_w']}:{H}:{plan['x']}:0,scale=1080:1920:flags=lanczos,"
-            f"unsharp=5:5:0.5:5:5:0.0,setsar=1,ass='{assf}'[v]")
+        # Punch-ins zoom the webcam (the reaction), not the gameplay.
+        g = (f"[0:v]{sel}split[a][b];[a]crop={bw}:{bh}:{bx}:{by},scale=1080:608:flags=lanczos,"
+             f"unsharp=5:5:0.8:5:5:0.0{zoompan(zooms, '1080x608', fps, 0.45)}[cam];"
+             f"[b]crop={gw}:{H}:{gx}:0,scale=1080:1312:flags=lanczos,unsharp=5:5:0.4:5:5:0.0[game];"
+             f"[cam][game]vstack,setsar=1[base]")
+    else:
+        g = (f"[0:v]{sel}crop={plan['crop_w']}:{H}:{plan['x']}:0,scale=1080:1920:flags=lanczos,"
+             f"unsharp=5:5:0.5:5:5:0.0{zoompan(zooms, '1080x1920', fps, 0.4)},setsar=1[base]")
+    if bar_dur:  # progress bar growing along the bottom edge
+        g += (f";color=c=0xFFE500:s=1080x14:r={fps}[bar];"
+              f"[base][bar]overlay=x='-w+w*t/{bar_dur:.3f}':y=H-h:shortest=1[base2]")
+        last = "base2"
+    else:
+        last = "base"
+    return g + f";[{last}]ass='{assf}':fontsdir='{fontsf}'[v]"
 
 
 def audio_filter(keep=None):
@@ -473,6 +592,41 @@ def audio_filter(keep=None):
 
 
 # ---------------------------------------------------------------- silence cutting
+def clip_db(src, s, e):
+    """Loudness in dB per 50 ms frame of [s, e]."""
+    raw = subprocess.run(["ffmpeg", "-v", "error", "-ss", f"{s:.3f}", "-to", f"{e:.3f}", "-i", str(src),
+                          "-vn", "-ac", "1", "-ar", "16000", "-f", "f32le", "-"],
+                         capture_output=True, check=True).stdout
+    a = np.frombuffer(raw, np.float32)
+    F = 800
+    k = len(a) // F
+    return 20 * np.log10(np.sqrt((a[:k * F].reshape(k, F) ** 2).mean(1)) + 1e-9)
+
+
+def find_zooms(src, s, e, keep, remap, n=3, min_gap=5.0, hold=1.3):
+    """Output-time windows for punch-ins on the loudest reactions (shouts, laughs)."""
+    db = clip_db(src, s, e)
+    if len(db) < 20:
+        return []
+    sm = np.convolve(db, np.ones(10) / 10, "same")  # 0.5 s smoothing
+    thr = np.percentile(sm, 85)
+    order = np.argsort(-sm)
+    picks = []
+    for i in order:
+        if sm[i] < thr or len(picks) >= n:
+            break
+        t = i * 0.05
+        if keep and not any(a <= t <= b for a, b in keep):
+            continue
+        if all(abs(t - q) > min_gap for q in picks):
+            picks.append(t)
+    zooms = []
+    for t in sorted(picks):
+        o = remap(t)
+        zooms.append((max(0.0, o - 0.25), o + hold))
+    return zooms
+
+
 def find_keep(src, s, e, words, drop_db=12.0, min_sil=0.4, pad=0.15):
     """Clip-local [a, b] spans to keep after removing dead air.
 
@@ -480,15 +634,11 @@ def find_keep(src, s, e, words, drop_db=12.0, min_sil=0.4, pad=0.15):
     at least drop_db quieter than the clip's median speech level, so loud
     non-speech moments (screams, hype music) stay in.  Returns None when
     nothing worth cutting is found."""
-    raw = subprocess.run(["ffmpeg", "-v", "error", "-ss", f"{s:.3f}", "-to", f"{e:.3f}", "-i", str(src),
-                          "-vn", "-ac", "1", "-ar", "16000", "-f", "f32le", "-"],
-                         capture_output=True, check=True).stdout
-    a = np.frombuffer(raw, np.float32)
-    F, step = 800, 0.05  # 50 ms frames
-    k = len(a) // F
+    db = clip_db(src, s, e)
+    step = 0.05
+    k = len(db)
     if k < 10:
         return None
-    db = 20 * np.log10(np.sqrt((a[:k * F].reshape(k, F) ** 2).mean(1)) + 1e-9)
     speech = np.zeros(k, bool)
     p = int(round(pad / step))
     for w in words:
@@ -553,26 +703,38 @@ PALETTE = {
 }
 
 
-def write_ass(path, words, clip_start, clip_end, y, remap=None, palette=PALETTE["color"]):
+def write_ass(path, words, clip_start, clip_end, y, remap=None, palette=PALETTE["color"],
+              hook=None, hook_y=60, duration=None, viral=True):
     remap = remap or (lambda t: t)
+    if viral:
+        # Anton, big and heavy, thick outline; hook = black text on a white box.
+        cap_style = "Style: Cap,Anton,124,&H00FFFFFF,&H00FFFFFF,&H00000000,&H90000000,0,0,0,0,100,100,1,0,1,9,4,5,40,40,0,1"
+        hook_style = (f"Style: Hook,Anton,96,&H00111111,&H00111111,&H00FFFFFF,&H00000000,0,0,0,0,100,100,1,0,"
+                      f"3,18,0,8,70,70,{hook_y},1")
+    else:
+        cap_style = f"Style: Cap,{FONT},88,&H00FFFFFF,&H00FFFFFF,&H00000000,&H80000000,-1,0,0,0,100,100,0,0,1,7,3,5,60,60,0,1"
+        hook_style = f"Style: Hook,{FONT},64,&H00111111,&H00111111,&H00FFFFFF,&H00000000,-1,0,0,0,100,100,0,0,3,14,0,8,90,90,{hook_y},1"
     hdr = f"""[Script Info]
 ScriptType: v4.00+
 PlayResX: 1080
 PlayResY: 1920
-WrapStyle: 2
+WrapStyle: 0
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: Cap,{FONT},88,&H00FFFFFF,&H00FFFFFF,&H00000000,&H80000000,-1,0,0,0,100,100,0,0,1,7,3,5,60,60,0,1
+{cap_style}
+{hook_style}
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 """
     ws = [dict(w, start=remap(w["start"] - clip_start), end=remap(w["end"] - clip_start)) for w in words
           if w["end"] > clip_start and w["start"] < clip_end]
+    max_chars = 14 if viral else 99  # the big font needs short pages to stay on one line
     pages, cur = [], []
-    for w in ws:  # 3 words per page; break early on long gaps or sentence ends
-        if cur and (len(cur) == 3 or w["start"] - cur[-1]["end"] > 0.6
+    for w in ws:  # <=3 words per page; break early on long gaps or sentence ends
+        n_chars = sum(len(x["word"].strip()) + 1 for x in cur) + len(w["word"].strip())
+        if cur and (len(cur) == 3 or n_chars > max_chars or w["start"] - cur[-1]["end"] > 0.6
                     or cur[-1]["word"].strip()[-1:] in ".?!"):
             pages.append(cur)
             cur = []
@@ -580,6 +742,10 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     if cur:
         pages.append(cur)
     lines = []
+    if hook:
+        end = duration if duration else (ws[-1]["end"] + 1 if ws else 60)
+        pop = r"{\fscx60\fscy60\t(0,180,\fscx100\fscy100)}" if viral else ""
+        lines.append(f"Dialogue: 1,{ass_time(0)},{ass_time(end)},Hook,,0,0,0,,{pop}{ass_escape(hook.upper())}")
     for pi, page in enumerate(pages):
         page_end = min(page[-1]["end"] + 0.3, pages[pi + 1][0]["start"] if pi + 1 < len(pages) else 1e9)
         toks = [ass_escape(w["word"].strip().upper()) for w in page]
@@ -589,7 +755,9 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             e = page[j + 1]["start"] if j + 1 < len(page) else page_end
             if e <= s:
                 continue
-            txt = " ".join((rf"{{\c{col}\fscx118\fscy118}}" + x + r"{\r}") if k == j else x
+            # active word pops: starts small and snaps up to 118 % in 90 ms
+            pop = r"\fscx75\fscy75\t(0,90,\fscx118\fscy118)" if viral else r"\fscx118\fscy118"
+            txt = " ".join((rf"{{\c{col}{pop}}}" + x + r"{\r}") if k == j else x
                            for k, x in enumerate(toks))
             lines.append(f"Dialogue: 0,{ass_time(s)},{ass_time(e)},Cap,,0,0,0,,{{\\pos(540,{y})}}{txt}")
     path.write_text(hdr + "\n".join(lines) + "\n")
@@ -609,6 +777,12 @@ def main():
                     help="highlight colour: 'color' cycles yellow/green/cyan/pink/orange per caption")
     ap.add_argument("--moments", choices=["auto", "clips", "chat"], default="auto",
                     help="Twitch: viewer clips first then chat spikes (auto), or only one of them")
+    ap.add_argument("--candidates", type=int, default=0,
+                    help="Twitch: gather this many candidate moments with transcripts into "
+                         "OUT/candidates.json and stop (an editor then writes a --plan)")
+    ap.add_argument("--plan", help="Twitch: render an edit plan JSON (picks, trims, hooks, teasers)")
+    ap.add_argument("--plain", action="store_true",
+                    help="plain style: no hook box, pop animation, punch-ins or progress bar")
     ap.add_argument("--keep-silence", action="store_true", help="don't jump-cut dead air")
     ap.add_argument("--silence-db", type=float, default=12.0,
                     help="cut wordless pauses this many dB below the speech level (default 12)")
@@ -626,30 +800,76 @@ def main():
     if vod:
         dur = float(info["duration"])
         print(f"source: {info.get('title')!r} {dur:.0f}s", flush=True)
+        cand_path = out / "candidates.json"
+        if args.plan:
+            # Render an edit plan: [{"id": candidate id, "start": s, "end": s,
+            #   "hook": "TEXT", "teaser": [s, s] | null}], times in VOD seconds.
+            cands = {c["id"]: c for c in json.loads(cand_path.read_text())}
+            ref = streamer_reference([c["section"] for c in cands.values()], work / f"streamer_ref_{vod}.npy")
+            report = []
+            for n, item in enumerate(json.loads(Path(args.plan).read_text()), 1):
+                c = cands[item["id"]]
+                s0 = c["section_start"]
+                sec = Path(c["section"])
+                a = max(item.get("start", c["s"]), s0) - s0
+                b = min(item.get("end", c["e"]), s0 + probe_duration(sec)) - s0
+                tz = item.get("teaser")
+                r = render_clip(sec, a, b, (a + b) / 2, n, out, work, args, zval=c.get("score", 0),
+                                mode=c["mode"], src_offset=s0, hook=item.get("hook"),
+                                teaser=(tz[0] - s0, tz[1] - s0) if tz else None,
+                                name=item.get("name") or f"clip{n}", ref=ref)
+                r.update({k: c[k] for k in ("title", "views", "clippers") if k in c})
+                report.append(r)
+            (out / "clips.json").write_text(json.dumps(report, indent=2))
+            return
+        want = args.candidates or args.n
         moments = []
         if args.moments in ("auto", "clips"):
-            moments = twitch_clip_moments(vod, dur, args.n)
+            moments = twitch_clip_moments(vod, dur, want)
             print(f"viewer-clip moments: {len(moments)}", flush=True)
-        if len(moments) < args.n and args.moments in ("auto", "chat"):
+        if len(moments) < want and args.moments in ("auto", "chat"):
             z = robust_z(twitch_chat_profile(vod, dur, work))
             pre, post = 30, 15
             busy = [(m["s"], m["e"]) for m in moments]
             zc = z.copy()
             for a, b in busy:  # don't re-pick a moment viewers already clipped
                 zc[max(0, int(a) - 60):int(b) + 60] = -1e9
-            for p in pick_peaks(zc, args.n - len(moments), min_gap=120, dur=dur, pre=pre, post=post):
+            for p in pick_peaks(zc, want - len(moments), min_gap=120, dur=dur, pre=pre, post=post):
                 q = twitch_refine_peak(vod, p)
                 moments.append({"s": max(0, q - pre), "e": min(dur, q + post), "p": q,
                                 "score": round(float(z[p]), 2), "mode": "twitch-chat"})
-        moments.sort(key=lambda m: m["s"])
         print("moments:", [(round(m["s"]), round(m["e"]), m["mode"], m.get("title", "")) for m in moments],
               flush=True)
+        if args.candidates:
+            # Gather candidates with transcripts for an editor (human or LLM) to pick
+            # from and write a --plan; nothing is rendered.
+            cands = []
+            for i, m in enumerate(moments, 1):
+                s, e = max(0, m["s"] - 8), min(dur, m["e"] + 8)  # slack for retiming
+                sec = download_section(args.source, s, e, work / f"section_{vod}_{int(s)}_{int(e)}.mp4")
+                words = transcribe(sec, work, args.model, 0, probe_duration(sec))
+                lines, cur, cur_t = [], [], None
+                for w in words:
+                    if cur and w["seg_start"] != cur_t:
+                        lines.append({"t": round(cur[0]["start"] + s, 1), "text": "".join(x["word"] for x in cur).strip()})
+                        cur = []
+                    cur.append(w)
+                    cur_t = w["seg_start"]
+                if cur:
+                    lines.append({"t": round(cur[0]["start"] + s, 1), "text": "".join(x["word"] for x in cur).strip()})
+                cands.append({"id": i, **m, "section": str(sec.resolve()), "section_start": s, "lines": lines})
+            cand_path.write_text(json.dumps(cands, indent=2))
+            print(f"wrote {cand_path} ({len(cands)} candidates)", flush=True)
+            return
+        moments.sort(key=lambda m: m["s"])
+        secs = [download_section(args.source, m["s"], m["e"],
+                                 work / f"section_{vod}_{int(m['s'])}_{int(m['e'])}.mp4") for m in moments]
+        ref = streamer_reference(secs, work / f"streamer_ref_{vod}.npy")
         report = []
-        for n, m in enumerate(moments, 1):
-            s, e = m["s"], m["e"]
-            sec = download_section(args.source, s, e, work / f"section_{vod}_{int(s)}_{int(e)}.mp4")
+        for n, (m, sec) in enumerate(zip(moments, secs), 1):
+            s = m["s"]
             r = render_clip(sec, 0.0, probe_duration(sec), m["p"] - s, n, out, work, args,
-                            zval=m["score"], mode=m["mode"], src_offset=s)
+                            zval=m["score"], mode=m["mode"], src_offset=s, hook=m.get("title"), ref=ref)
             r.update({k: m[k] for k in ("title", "views", "clippers") if k in m})
             report.append(r)
         (out / "clips.json").write_text(json.dumps(report, indent=2))
@@ -710,34 +930,80 @@ def main():
     (out / "clips.json").write_text(json.dumps(report, indent=2))
 
 
-def render_clip(src, s, e, p, n, out, work, args, zval, mode, src_offset=0.0):
-    """Render [s, e] of src as clip n; p is the peak in src time. Times in the
-    report are shifted by src_offset back to the original video's timeline."""
-    W, H = probe_size(src)
-    words = transcribe(src, work, args.model, s, e)
-    plan = plan_framing(src, s, e, W, H)
-    keep = None if args.keep_silence else find_keep(src, s, e, words, drop_db=args.silence_db)
-    remap = remap_fn(keep)
-    ass = work / f"clip{n}.ass"
-    nw = write_ass(ass, words, s, e, y=1460 if plan["mode"] == "crop" else 1180,
-                   remap=remap, palette=PALETTE[args.captions])
-    mp4 = out / f"clip{n}_vertical.mp4"
-    sh(["ffmpeg", "-y", "-v", "error", "-ss", f"{s:.2f}", "-to", f"{e:.2f}", "-i", src,
-        "-filter_complex", video_filter(plan, W, H, ass, keep) + ";" + audio_filter(keep),
+def probe_fps(path):
+    r = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
+                        "stream=r_frame_rate", "-of", "csv=p=0", str(path)],
+                       capture_output=True, text=True, check=True)
+    num, den = r.stdout.strip().split("/")
+    return min(60, max(24, round(int(num) / int(den))))
+
+
+def encode(src, s, e, filt, path):
+    sh(["ffmpeg", "-y", "-v", "error", "-ss", f"{s:.3f}", "-to", f"{e:.3f}", "-i", src,
+        "-filter_complex", filt,
         # one high-quality encode at the source frame rate (60 fps stays 60);
         # the bitrate cap keeps phone downloads sane without a second lossy pass
         "-map", "[v]", "-map", "[a]", "-c:v", "libx264", "-preset", "slow", "-crf", "18",
         "-maxrate", "12M", "-bufsize", "24M", "-profile:v", "high",
-        "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k", "-ar", "48000",
-        "-movflags", "+faststart", mp4])
-    thumb = out / f"clip{n}_frame.jpg"
-    sh(["ffmpeg", "-y", "-v", "error", "-ss", f"{max(0.5, remap(p - s)):.2f}", "-i", mp4, "-frames:v", "1", thumb])
+        "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2",
+        "-movflags", "+faststart", path])
+
+
+def render_clip(src, s, e, p, n, out, work, args, zval, mode, src_offset=0.0, hook=None, teaser=None,
+                name=None, ref=None):
+    """Render [s, e] of src as clip n; p is the peak in src time. Times in the
+    report are shifted by src_offset back to the original video's timeline.
+
+    hook: title text pinned at the top.  teaser: (a, b) in src time, a 1-3 s
+    payoff played first as a cold open before the clip proper."""
+    viral = not args.plain
+    W, H = probe_size(src)
+    fps = probe_fps(src)
+    src_dur = probe_duration(src)
+    # short sections: transcribe once in full so re-trimmed plans reuse the cache
+    words = transcribe(src, work, args.model, 0, src_dur) if src_dur < 900 else transcribe(src, work, args.model, s, e)
+    plan = plan_framing(src, s, e, W, H, ref=ref)
+    keep = None if args.keep_silence else find_keep(src, s, e, words, drop_db=args.silence_db)
+    remap = remap_fn(keep)
+    body_dur = sum(b - a for a, b in keep) if keep else e - s
+    zooms = find_zooms(src, s, e, keep, remap) if viral else []
+    # stack: hook is a title bar across the cam/gameplay seam, captions in the gameplay
+    cap_y = 1300 if plan["mode"] == "crop" else 1240
+    hook_y = 170 if plan["mode"] == "crop" else 548
+    stem = name or f"clip{n}"
+    ass = work / f"{stem}.ass"
+    nw = write_ass(ass, words, s, e, y=cap_y, remap=remap, palette=PALETTE[args.captions],
+                   hook=hook, hook_y=hook_y, duration=body_dur, viral=viral)
+    mp4 = out / f"{stem}.mp4"
+    body = work / f"{stem}_body.mp4" if teaser else mp4
+    encode(src, s, e, video_filter(plan, W, H, ass, keep, zooms, fps, bar_dur=body_dur if viral else None)
+           + ";" + audio_filter(keep), body)
+    t_off = 0.0
+    if teaser:
+        ta, tb = teaser
+        t_ass = work / f"{stem}_teaser.ass"
+        write_ass(t_ass, words, ta, tb, y=cap_y, palette=PALETTE[args.captions],
+                  hook=hook, hook_y=hook_y, duration=tb - ta, viral=viral)
+        t_mp4 = work / f"{stem}_teaser.mp4"
+        # the cold open is zoomed in the whole way so it reads as a flash-forward
+        encode(src, ta, tb, video_filter(plan, W, H, t_ass, None, [(0, tb - ta + 1)], fps) + ";" + audio_filter(),
+               t_mp4)
+        lst = work / f"{stem}_concat.txt"
+        lst.write_text(f"file '{t_mp4.resolve()}'\nfile '{body.resolve()}'\n")
+        sh(["ffmpeg", "-y", "-v", "error", "-f", "concat", "-safe", "0", "-i", lst, "-c", "copy",
+            "-movflags", "+faststart", mp4])
+        t_off = tb - ta
+    thumb = out / f"{stem}_frame.jpg"
+    sh(["ffmpeg", "-y", "-v", "error", "-ss", f"{max(0.5, t_off + remap(p - s)):.2f}", "-i", mp4,
+        "-frames:v", "1", thumb])
     text = " ".join(w["word"].strip() for w in words if s <= w["start"] < e)
     final = probe_duration(mp4)
     info = {"clip": mp4.name, "start": round(s + src_offset, 2), "end": round(e + src_offset, 2),
-            "peak": round(p + src_offset, 2), "z": round(zval, 2), "mode": mode, "framing": plan["mode"],
-            "faces_sampled": plan["faces"], "caption_words": nw,
-            "silence_cut_s": round((e - s) - final, 1), "duration": round(final, 1), "transcript": text}
+            "peak": round(p + src_offset, 2), "score": round(zval, 2), "mode": mode, "framing": plan["mode"],
+            "faces_sampled": plan["faces"], "caption_words": nw, "hook": hook,
+            "teaser": [round(t + src_offset, 2) for t in teaser] if teaser else None,
+            "zooms": len(zooms), "silence_cut_s": round((e - s) - body_dur, 1),
+            "duration": round(final, 1), "transcript": text}
     print(json.dumps({k: v for k, v in info.items() if k != "transcript"}), flush=True)
     return info
 
