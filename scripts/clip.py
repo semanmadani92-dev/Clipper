@@ -781,6 +781,10 @@ def main():
                     help="Twitch: gather this many candidate moments with transcripts into "
                          "OUT/candidates.json and stop (an editor then writes a --plan)")
     ap.add_argument("--plan", help="Twitch: render an edit plan JSON (picks, trims, hooks, teasers)")
+    ap.add_argument("--whole", action="store_true",
+                    help="edit the entire source as one short (for sources that are already a moment)")
+    ap.add_argument("--hook", help="hook title for --whole")
+    ap.add_argument("--name", help="output file stem for --whole")
     ap.add_argument("--plain", action="store_true",
                     help="plain style: no hook box, pop animation, punch-ins or progress bar")
     ap.add_argument("--keep-silence", action="store_true", help="don't jump-cut dead air")
@@ -901,6 +905,13 @@ def main():
     src = fetch(args.source, work)
     dur = probe_duration(src)
     print(f"source: {src} {dur:.0f}s", flush=True)
+
+    if args.whole:
+        # Already a moment (e.g. a Twitch clip): edit all of it, no moment picking.
+        r = render_clip(src, 0.0, dur, dur / 2, 1, out, work, args, zval=0.0, mode="whole",
+                        hook=args.hook, name=args.name)
+        (out / f"{args.name or 'clip1'}.json").write_text(json.dumps(r, indent=2))
+        return
 
     if args.chat:
         chat = load_chat(args.chat)
